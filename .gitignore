@@ -207,3 +207,6 @@ marimo/_lsp/
 __marimo__/
 
 .vscode
+
+*.hydra-multirun
+ODE_sync/generated/solutions

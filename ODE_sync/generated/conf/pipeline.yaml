@@ -1,0 +1,21 @@
+seed: 42
+
+dim: 10
+scale: 10
+coupling: 3.0
+t_end: 500.0
+n_times: 500
+same_dynamics: true
+graph_generator: current_random_antisymmetric
+small_world_degree: 4
+small_world_rewire_probability: 0.1
+solver: scipy
+krylov_dim: 30
+output_dir: solutions/results
+
+hydra:
+  run:
+    dir: ODE_sync/generated/.hydra-run
+  sweep:
+    dir: ODE_sync/generated/.hydra-multirun/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}
