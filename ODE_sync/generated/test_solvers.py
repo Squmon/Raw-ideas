@@ -37,7 +37,7 @@ class SynchronizationSolverTests(unittest.TestCase):
     def test_small_world_generator_is_seeded_scaled_laplacian(self) -> None:
         config = ExperimentConfig(
             dim=10,
-            graph_generator="small_world",
+            graph_generator="small_world_laplacian",
             small_world_degree=4,
             small_world_rewire_probability=0.0,
         )
@@ -52,7 +52,7 @@ class SynchronizationSolverTests(unittest.TestCase):
         np.testing.assert_allclose(np.diag(dense), -0.4, atol=1e-7)
 
     def test_small_world_rejects_degree_not_less_than_dimension(self) -> None:
-        config = ExperimentConfig(dim=4, graph_generator="small_world")
+        config = ExperimentConfig(dim=4, graph_generator="small_world_laplacian")
         with self.assertRaisesRegex(ValueError, "smaller than dim"):
             generate_system(41, config)
 

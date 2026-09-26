@@ -88,6 +88,19 @@ browser. When multiple runs share a seed/dimension pair (for example, a sweep
 over coupling strength), the cell shows their mean final MSE and its detail
 page contains plots for each matching run.
 
+Each run's detail section also includes separate graph views for systems A and
+B. Connectivity is recovered from the saved matrices, and node positions are
+computed by the viewer with NetworkX's Kamada-Kawai layout. The synchronization
+node is highlighted in each graph. Four additional animated graph views color
+nodes by system A state, system B state, signed state difference, and absolute
+state difference. Each animation has play/pause controls and a time slider;
+positions and edges remain fixed while vertex colors update. To keep grouped
+HTML pages practical for long runs, animations use at most 120 evenly spaced
+saved times including both endpoints. The static time-series plots retain all
+saved samples.
+
+The HTML pages and Plotly figures use a dark theme.
+
 Detail pages retain component line plots through dimension 15. Above 15
 dimensions, the `a`, `b`, and `a - b` panels switch to time-by-component
 heatmaps with a diverging color ramp; hub traces and synchronization-error

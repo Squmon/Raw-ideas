@@ -10,8 +10,11 @@ import os
 from pathlib import Path
 import re
 
+import networkx as nx
 import numpy as np
 import plotly.graph_objects as go
+
+MAX_ANIMATION_FRAMES = 120
 
 
 @dataclass(frozen=True)
@@ -112,7 +115,7 @@ def create_detail_figures(record: ResultRecord) -> list[go.Figure]:
             y_title = "State"
         figure.update_layout(
             title=title,
-            template="plotly_white",
+            template="plotly_dark",
             height=460,
             hovermode="x unified",
             legend={"title": {"text": title}, "groupclick": "togglegroup"},
@@ -120,7 +123,6 @@ def create_detail_figures(record: ResultRecord) -> list[go.Figure]:
         figure.update_xaxes(title_text="Time")
         figure.update_yaxes(title_text=y_title)
         return figure
-
     states_a_figure = component_figure(state_a, "System a states")
     states_b_figure = component_figure(state_b, "System b states")
     difference_figure = component_figure(difference, "State differences (a - b)")
@@ -139,7 +141,7 @@ def create_detail_figures(record: ResultRecord) -> list[go.Figure]:
     )
     hub_figure.update_layout(
         title=f"Coupled hub states (a[{hub_a}], b[{hub_b}])",
-        template="plotly_white",
+        template="plotly_dark",
         height=380,
         hovermode="x unified",
         legend={"title": {"text": "Hub state"}},
@@ -152,7 +154,7 @@ def create_detail_figures(record: ResultRecord) -> list[go.Figure]:
     )
     error_figure.update_layout(
         title="Synchronization error",
-        template="plotly_white",
+        template="plotly_dark",
         height=380,
         hovermode="x unified",
         legend={"title": {"text": "Error metric"}},
@@ -161,7 +163,318 @@ def create_detail_figures(record: ResultRecord) -> list[go.Figure]:
     error_figure.update_yaxes(
         title_text="MSE", type="log" if np.all(mse > 0) else "linear"
     )
-    return [states_a_figure, states_b_figure, hub_figure, error_figure, difference_figure]
+    graph_a = _graph_from_matrix(arrays["matrix_a"])
+    graph_b = _graph_from_matrix(arrays["matrix_b"])
+    positions_a = _graph_positions(graph_a)
+    positions_b = _graph_positions(graph_b)
+    graph_a_figure = create_graph_figure(
+        arrays["matrix_a"], f"System A graph | seed {record.seed}", hub_a,
+        graph=graph_a, positions=positions_a,
+    )
+    graph_b_figure = create_graph_figure(
+        arrays["matrix_b"], f"System B graph | seed {record.seed}", hub_b,
+        graph=graph_b, positions=positions_b,
+    )
+    animated_graph_figures = [
+        create_animated_graph_figure(
+            arrays["matrix_a"], state_a, ts, f"System A state | seed {record.seed}", hub_a,
+            graph=graph_a, positions=positions_a,
+        ),
+        create_animated_graph_figure(
+            arrays["matrix_b"], state_b, ts, f"System B state | seed {record.seed}", hub_b,
+            graph=graph_b, positions=positions_b,
+        ),
+        create_animated_graph_figure(
+            arrays["matrix_a"], difference, ts,
+            f"State difference (A - B) | seed {record.seed}", hub_a,
+            colorscale="RdBu", symmetric_scale=True, graph=graph_a, positions=positions_a,
+        ),
+        create_animated_graph_figure(
+            arrays["matrix_a"], np.abs(difference), ts,
+            f"Absolute state difference | seed {record.seed}", hub_a,
+            graph=graph_a, positions=positions_a,
+        ),
+    ]
+    return [
+        graph_a_figure,
+        graph_b_figure,
+        *animated_graph_figures,
+        states_a_figure,
+        states_b_figure,
+        hub_figure,
+        error_figure,
+        difference_figure,
+    ]
+
+
+def _graph_from_matrix(matrix: np.ndarray) -> nx.Graph:
+    matrix = np.asarray(matrix)
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("graph matrix must be square")
+    graph = nx.Graph()
+    graph.add_nodes_from(range(matrix.shape[0]))
+    for source in range(matrix.shape[0]):
+        for target in range(source + 1, matrix.shape[0]):
+            weight = max(
+                abs(float(matrix[source, target])),
+                abs(float(matrix[target, source])),
+            )
+            if weight > 0:
+                graph.add_edge(source, target, weight=weight)
+    return graph
+
+
+def _graph_positions(graph: nx.Graph) -> dict[int, np.ndarray]:
+    if graph.number_of_edges():
+        return nx.kamada_kawai_layout(graph, weight=None)
+    return nx.circular_layout(graph)
+
+
+def _graph_edge_coordinates(
+    graph: nx.Graph,
+    positions: dict[int, np.ndarray],
+) -> tuple[list[float | None], list[float | None]]:
+    edge_x: list[float | None] = []
+    edge_y: list[float | None] = []
+    for source, target in graph.edges:
+        edge_x.extend((positions[source][0], positions[target][0], None))
+        edge_y.extend((positions[source][1], positions[target][1], None))
+    return edge_x, edge_y
+
+
+def create_animated_graph_figure(
+    matrix: np.ndarray,
+    values_by_time: np.ndarray,
+    times: np.ndarray,
+    title: str,
+    hub_index: int,
+    *,
+    colorscale: str = "Viridis",
+    symmetric_scale: bool = False,
+    max_frames: int = MAX_ANIMATION_FRAMES,
+    graph: nx.Graph | None = None,
+    positions: dict[int, np.ndarray] | None = None,
+) -> go.Figure:
+    """Animate node colors over time while keeping layout and edges fixed."""
+    matrix = np.asarray(matrix)
+    values_by_time = np.asarray(values_by_time)
+    times = np.asarray(times)
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("graph matrix must be square")
+    if values_by_time.ndim != 2 or values_by_time.shape[1] != matrix.shape[0]:
+        raise ValueError("values_by_time must have shape (n_times, graph_dimension)")
+    if values_by_time.shape[0] != len(times):
+        raise ValueError("times length must match values_by_time")
+    if max_frames < 2:
+        raise ValueError("max_frames must be at least 2")
+
+    frame_indices = np.unique(
+        np.linspace(
+            0,
+            len(times) - 1,
+            min(max_frames, len(times)),
+            dtype=np.int64,
+        )
+    )
+    frame_times = times[frame_indices]
+    frame_values = values_by_time[frame_indices]
+
+    graph = graph if graph is not None else _graph_from_matrix(matrix)
+    positions = positions if positions is not None else _graph_positions(graph)
+    node_ids = list(graph.nodes)
+    node_x = [positions[node][0] for node in node_ids]
+    node_y = [positions[node][1] for node in node_ids]
+    degrees = [int(graph.degree[node]) for node in node_ids]
+    weighted_degrees = [
+        float(sum(data["weight"] for _, _, data in graph.edges(node, data=True)))
+        for node in node_ids
+    ]
+    edge_x, edge_y = _graph_edge_coordinates(graph, positions)
+    max_abs_value = max(float(np.max(np.abs(values_by_time))), np.finfo(np.float32).eps)
+    if symmetric_scale:
+        color_min, color_max = -max_abs_value, max_abs_value
+    else:
+        color_min = min(0.0, float(np.min(values_by_time)))
+        color_max = max_abs_value
+
+    initial_values = frame_values[0]
+    initial_customdata = np.column_stack((degrees, weighted_degrees, initial_values))
+    figure = go.Figure(
+        data=[
+            go.Scatter(
+                x=edge_x,
+                y=edge_y,
+                mode="lines",
+                line={"color": "#536273", "width": 1.5},
+                hoverinfo="skip",
+                name="connections",
+            ),
+            go.Scatter(
+                x=node_x,
+                y=node_y,
+                mode="markers+text",
+                text=[str(node) for node in node_ids],
+                textposition="top center",
+                marker={
+                    "size": 15,
+                    "color": initial_values,
+                    "colorscale": colorscale,
+                    "cmin": color_min,
+                    "cmax": color_max,
+                    "showscale": True,
+                    "colorbar": {"title": title.split("|")[0].strip()},
+                    "line": {
+                        "color": ["#ffcf70" if node == hub_index else "#dce4ed" for node in node_ids],
+                        "width": [3 if node == hub_index else 1 for node in node_ids],
+                    },
+                },
+                customdata=initial_customdata,
+                hovertemplate=(
+                    "Node %{text}<br>Degree %{customdata[0]}"
+                    "<br>Weighted degree %{customdata[1]:.4g}"
+                    "<br>Value %{customdata[2]:.5g}<extra></extra>"
+                ),
+                name="vertices",
+            ),
+        ],
+        frames=[
+            go.Frame(
+                name=str(frame_index),
+                data=[
+                    go.Scatter(
+                        marker={"color": frame_values_at_time},
+                        customdata=np.column_stack(
+                            (degrees, weighted_degrees, frame_values_at_time)
+                        ),
+                    )
+                ],
+                traces=[1],
+                layout={"title": f"{title}<br><sup>t = {time_value:.5g}</sup>"},
+            )
+            for frame_index, (time_value, frame_values_at_time) in enumerate(
+                zip(frame_times, frame_values, strict=True)
+            )
+        ],
+    )
+    frame_names = [str(frame_index) for frame_index in range(len(frame_times))]
+    figure.update_layout(
+        title=f"{title}<br><sup>t = {frame_times[0]:.5g}</sup>",
+        template="plotly_dark",
+        height=560,
+        showlegend=False,
+        margin={"l": 20, "r": 30, "t": 80, "b": 80},
+        updatemenus=[
+            {
+                "type": "buttons",
+                "showactive": False,
+                "x": 0.02,
+                "y": -0.12,
+                "buttons": [
+                    {
+                        "label": "Play",
+                        "method": "animate",
+                        "args": [
+                            None,
+                            {"frame": {"duration": 120, "redraw": True}, "fromcurrent": True},
+                        ],
+                    },
+                    {
+                        "label": "Pause",
+                        "method": "animate",
+                        "args": [[None], {"frame": {"duration": 0, "redraw": False}, "mode": "immediate"}],
+                    },
+                ],
+            }
+        ],
+        sliders=[
+            {
+                "active": 0,
+                "x": 0.20,
+                "len": 0.78,
+                "y": -0.12,
+                "currentvalue": {"prefix": "Time: "},
+                "steps": [
+                    {
+                        "label": f"{time_value:.4g}",
+                        "method": "animate",
+                        "args": [
+                            [frame_name],
+                            {"mode": "immediate", "frame": {"duration": 0, "redraw": True}, "transition": {"duration": 0}},
+                        ],
+                    }
+                    for frame_name, time_value in zip(
+                        frame_names, frame_times, strict=True
+                    )
+                ],
+            }
+        ],
+    )
+    figure.update_xaxes(visible=False, scaleanchor="y", scaleratio=1)
+    figure.update_yaxes(visible=False)
+    return figure
+
+
+def create_graph_figure(
+    matrix: np.ndarray,
+    title: str,
+    hub_index: int,
+    *,
+    graph: nx.Graph | None = None,
+    positions: dict[int, np.ndarray] | None = None,
+) -> go.Figure:
+    """Visualize a system matrix as an undirected weighted graph."""
+    graph = graph if graph is not None else _graph_from_matrix(matrix)
+    positions = positions if positions is not None else _graph_positions(graph)
+
+    edge_x = []
+    edge_y = []
+    for source, target in graph.edges:
+        edge_x.extend((positions[source][0], positions[target][0], None))
+        edge_y.extend((positions[source][1], positions[target][1], None))
+
+    node_x = [positions[node][0] for node in graph.nodes]
+    node_y = [positions[node][1] for node in graph.nodes]
+    node_colors = ["#cf563f" if node == hub_index else "#267c72" for node in graph.nodes]
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=edge_x,
+            y=edge_y,
+            mode="lines",
+            line={"color": "#a7b4af", "width": 1.5},
+            hoverinfo="skip",
+            name="connections",
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=node_x,
+            y=node_y,
+            mode="markers+text",
+            text=[str(node) for node in graph.nodes],
+            textposition="top center",
+            marker={"size": 13, "color": node_colors, "line": {"color": "white", "width": 1}},
+            customdata=[
+                [int(graph.degree[node]), float(sum(data["weight"] for _, _, data in graph.edges(node, data=True)))]
+                for node in graph.nodes
+            ],
+            hovertemplate=(
+                "Node %{text}<br>Degree %{customdata[0]}"
+                "<br>Weighted degree %{customdata[1]:.4g}<extra></extra>"
+            ),
+            name="nodes",
+        )
+    )
+    figure.update_layout(
+        title=title,
+        template="plotly_dark",
+        height=470,
+        showlegend=False,
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
+    )
+    figure.update_xaxes(visible=False, scaleanchor="y", scaleratio=1)
+    figure.update_yaxes(visible=False)
+    return figure
 
 
 def create_index_figure(
@@ -229,7 +542,7 @@ def create_index_figure(
     )
     figure.update_layout(
         title="Final synchronization MSE by seed and dimension",
-        template="plotly_white",
+        template="plotly_dark",
         height=max(430, 90 * len(dimensions) + 180),
         margin={"l": 90, "r": 50, "t": 90, "b": 80},
         clickmode="event",
@@ -248,12 +561,16 @@ def _html_page(title: str, content: str, extra_script: str = "") -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{safe_title}</title>
   <style>
-    :root {{ color-scheme: light; font-family: system-ui, sans-serif; color: #17211f; background: #f4f7f5; }}
-    body {{ margin: 0; }}
-    header {{ padding: 18px 24px; border-bottom: 1px solid #d6dfda; background: #fff; }}
-    header a {{ color: #176b55; font-weight: 650; text-decoration: none; }}
+    :root {{ color-scheme: dark; font-family: system-ui, sans-serif; color: #e4ebf3; background: #111820; }}
+    body {{ margin: 0; background: #111820; color: #e4ebf3; }}
+    header {{ padding: 18px 24px; border-bottom: 1px solid #2d3947; background: #19232e; }}
+    header a {{ color: #88d2bf; font-weight: 650; text-decoration: none; }}
     main {{ max-width: 1500px; margin: 0 auto; padding: 12px 18px 36px; }}
     .plotly-graph-div {{ width: 100%; }}
+    section {{ margin: 0 0 28px; padding: 16px; border-bottom: 1px solid #2d3947; }}
+    h1, h2, p, summary {{ color: #e4ebf3; }}
+    code {{ color: #b7d5f2; overflow-wrap: anywhere; }}
+    a {{ color: #88d2bf; }}
     @media (max-width: 640px) {{ header {{ padding: 14px 16px; }} main {{ padding: 8px 4px 24px; }} }}
   </style>
 </head>
